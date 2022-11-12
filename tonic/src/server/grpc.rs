@@ -317,13 +317,17 @@ where
 
         futures_util::pin_mut!(stream);
 
-        let message = stream
+        let message = {
+          let _map_guard = with_incremented_gauge!("tonic_unary_map_message", 1 as f64);
+          stream
             .try_next()
             .await?
-            .ok_or_else(|| Status::new(Code::Internal, "Missing request message."))?;
+            .ok_or_else(|| Status::new(Code::Internal, "Missing request message."))?
+        };
 
         let mut req = Request::from_http_parts(parts, message);
 
+        let _trailers_guard = with_incremented_gauge!("tonic_unary_map_trailers", 1 as f64);
         if let Some(trailers) = stream.trailers().await? {
             req.metadata_mut().merge(trailers);
         }
