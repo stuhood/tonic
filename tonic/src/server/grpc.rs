@@ -21,6 +21,31 @@ macro_rules! t {
     };
 }
 
+pub struct GaugeDecrement<F: FnOnce() -> ()>(Option<F>);
+
+impl<F: FnOnce() -> ()> GaugeDecrement<F> {
+    pub fn new(f: F) -> Self {
+        GaugeDecrement(Some(f))
+    }
+}
+
+impl<F: FnOnce() -> ()> Drop for GaugeDecrement<F> {
+    fn drop(&mut self) {
+        self.0.take().unwrap()()
+    }
+}
+
+/// Temporarily increments a gauge, and returns a guard that will decrement the metric when
+/// dropped.
+#[macro_export]
+macro_rules! with_incremented_gauge {
+    ($name:literal, $value:literal $($tail:tt)*) => {{
+        metrics::increment_gauge!($name, $value $($tail)*);
+
+        $crate::server::grpc::GaugeDecrement::new(|| metrics::decrement_gauge!($name, $value $($tail)*))
+    }};
+}
+
 /// A gRPC Server handler.
 ///
 /// This will wrap some inner [`Codec`] and provide utilities to handle
@@ -150,22 +175,30 @@ where
             self.send_compression_encodings,
         );
 
-        let request = match self.map_request_unary(req).await {
-            Ok(r) => r,
-            Err(status) => {
-                return self
-                    .map_response::<stream::Once<future::Ready<Result<T::Encode, Status>>>>(
-                        Err(status),
-                        accept_encoding,
-                        SingleMessageCompressionOverride::default(),
-                    );
-            }
+        let _unary_guard = with_incremented_gauge!("tonic_unary", 1 as f64);
+        
+        let request = {
+          let _map_guard = with_incremented_gauge!("tonic_unary_map", 1 as f64);
+          match self.map_request_unary(req).await {
+              Ok(r) => r,
+              Err(status) => {
+                  return self
+                      .map_response::<stream::Once<future::Ready<Result<T::Encode, Status>>>>(
+                          Err(status),
+                          accept_encoding,
+                          SingleMessageCompressionOverride::default(),
+                      );
+              }
+          }
         };
 
-        let response = service
+        let response = {
+          let _call_guard = with_incremented_gauge!("tonic_unary_call", 1 as f64);
+          service
             .call(request)
             .await
-            .map(|r| r.map(|m| stream::once(future::ok(m))));
+            .map(|r| r.map(|m| stream::once(future::ok(m))))
+        };
 
         let compression_override = compression_override_from_response(&response);
 
